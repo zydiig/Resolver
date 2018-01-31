@@ -1,14 +1,14 @@
 Resolver
 ==============
-A simple DNS resolver that goes through a SOCKS proxy.
+A simple DNS resolver that goes through a SOCKS 5 proxy.
 
 resolve.py
 ---------
 The main program.
 
-Modify and save the following snippet as `[CONFIG_FILE_NAME]`:
+1. Modify and save the following snippet as `[CONFIG_FILE_NAME]`:
 
-~~~
+~~~json
 {
   "local_addr":"",
   "proxy_addr":"",
@@ -17,9 +17,9 @@ Modify and save the following snippet as `[CONFIG_FILE_NAME]`:
 }
 ~~~
 
-Write down the domain suffixes you want to query without the proxy and save as `[RULESET_FILENAME]`.
+2. Write down the domain suffixes you want to query without the proxy and save as `[RULESET_FILE_NAME]`.
 
-Run `python3 resolve.py -c [CONFIG_FILE_NAME] -x [RULESET_FILENAME]` and that's all.
+3. Run `python3 resolve.py -c [CONFIG_FILE_NAME] -x [RULESET_FILE_NAME]`.
 
 Command-line flags:
 
@@ -39,6 +39,17 @@ This file includes an easy-to-use Buffer class, and provides a basic DNS parser 
 EDNS0-specific RRs are kept as is. 
 DNSSEC is not tested.
 
+TODO
+---------
+* Implement repacking of DNS message
+  * Implement repacking with *compression* (kinda pointless nowadays)
+* Parse EDNS0 info
+* Reuse TCP connection with a relay on a remote server
+* Actually truncate UDP response
+* Implement DNS caching
+* Automatically choose between proxy and direct
+* More powerful rule matching
+ 
 License
 ---------
 [GPLv3](https://en.wikipedia.org/wiki/GNU_General_Public_License)

@@ -125,7 +125,8 @@ class Message:
         return buf.read()
 
     def __str__(self):
-        return f'Message(id={self.id},qr={self.qr},opcode={self.opcode},tc={self.tc},q={self.qdlist},a={self.anlist})'
+        flags = [k for k, v in {"aa": self.aa, "tc": self.tc, "rd": self.rd, "ra": self.ra}.items() if v]
+        return f'Message(id={self.id},qr={self.qr},opcode={self.opcode},flags={flags},q={self.qdlist},a={self.anlist})'
 
 
 class Question:
