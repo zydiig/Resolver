@@ -1,42 +1,44 @@
-import asyncio
-import uvloop
+# SPDX-License-Identifier: GPL-3.0-only
+
+import curio
 import struct
-import socket
+from curio import socket
 import json
-import traceback
-import datetime
-from protocol import Buffer
-
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-
-
-class AsyncSocket:
-    def __init__(self, loop=None):
-        if not loop:
-            loop = asyncio.get_event_loop()
-        self.s = socket.socket()
-        self.s.setblocking(False)
-        self.loop = loop
-
-    async def connect(self, remote):
-        await self.loop.sock_connect(self.s, remote)
-
-    async def recv(self, length):
-        return await self.loop.sock_recv(self.s, length)
-
-    async def sendall(self, data):
-        return await self.loop.sock_sendall(self.s, data)
-
-    async def ensure_recv(self, length):
-        buf = Buffer()
-        while len(buf) < length:
-            buf.write(await self.recv(length))
-        return buf.read()
+from protocol import Buffer, parse_message
+from traceback import format_exc
+from sys import exc_info, stderr
+import logging
+from argparse import ArgumentParser
+import os
 
 
+class Configuration:
+    def __init__(self, config, logger, ruleset):
+        self.config, self.logger, self.ruleset = config, logger, ruleset
 
-def get_fqdn_list(req):
-    data = Buffer(req)
+    def __getitem__(self, item):
+        return self.config.get(item)
+
+    def __getattr__(self, item):
+        return self.config.get(item)
+
+
+def parse_ip(ip_string):
+    ip, port = ip_string.split(":")
+    return ip, int(port)
+
+
+def need_proxy(request, rules):
+    fqdn_list = get_fqdn_list(request)
+    for fqdn in fqdn_list:
+        for rule in rules:
+            if fqdn.rstrip(".").endswith(rule):
+                return False
+    return True
+
+
+def get_fqdn_list(request):
+    data = Buffer(request)
     data.discard(4)
     qdcount = data.read_packed(">H")
     data.discard(2 * 3)
@@ -50,131 +52,183 @@ def get_fqdn_list(req):
             else:
                 labels.append(data.read(label_length).decode("ascii"))
         fqdn_list.append(".".join(labels) + ".")
-        data.discard(2*2)
+        data.discard(2 * 2)
     return fqdn_list
 
 
-def need_proxy(fqdn_list, rules):
-    for fqdn in fqdn_list:
-        for rule in rules:
-            if fqdn.rstrip(".").endswith(rule):
-                print("0",fqdn_list)
-                return False
-    print("1",fqdn_list)
+class ExtendedSocket:
+    _relayed = ("recv", "close", "sendall", "connect")
+
+    def __init__(self, s=None):
+        self.s = s if s else socket.socket()
+
+    async def ensure_recv(self, length):
+        data = bytearray()
+        while len(data) < length:
+            data += await self.s.recv(length - len(data))
+        return bytes(data)
+
+    async def recv_uint16be(self):
+        return struct.unpack(">H", await self.ensure_recv(2))[0]
+
+    def __getattr__(self, item):
+        if item in self._relayed:
+            return getattr(self.s, item)
+        raise AttributeError(f"{item} does not exist")
+
+
+async def resolve(config, request, use_proxy=True):
+    config.logger.debug(str(parse_message(request)))
+    remote = ExtendedSocket()
+    if use_proxy:
+        await remote.connect(config.proxy_addr)
+        await remote.sendall(b'\x05\x01\x00')
+        assert (await remote.ensure_recv(2)) == b'\x05\x00'
+        await remote.sendall(b'\x05\x01\x00\x01' + socket.inet_aton(config.remote_addr[0]) + struct.pack("!H", config["remote_addr"][1]))
+        kind = (await remote.ensure_recv(4))[3]
+        if kind == 1:
+            await remote.ensure_recv(4)
+        elif kind == 3:
+            length = (await remote.ensure_recv(1))[0]
+            await remote.ensure_recv(length)
+        elif kind == 4:
+            await remote.ensure_recv(16)
+        else:
+            raise ValueError(f'Invalid ADDR type {kind}')
+        await remote.ensure_recv(2)
+    else:
+        await remote.connect(config.direct_addr)
+    await remote.sendall(struct.pack(">H", len(request)))
+    await remote.sendall(request)
+    length = await remote.recv_uint16be()
+    resp = await remote.ensure_recv(length)
+    config.logger.debug(str(parse_message(resp)))
+    return resp
+
+
+def log_exception(config):
+    exc = exc_info()
+    if exc[0] == KeyboardInterrupt:
+        return False
+    elif exc[0] == curio.errors.TaskCancelled:
+        return False
+    config.logger.debug("\n" + format_exc())
     return True
 
 
-class UDPListenerProtocol(asyncio.Protocol):
-    def __init__(self, cfg, loop, rules):
-        self.cfg, self.loop, self.rules = cfg, loop, rules
-
-    def connection_made(self, transport):
-        self.transport = transport
-
-    def datagram_received(self, data, addr):
-        print(f"UDP request from {addr}")
-        fqdn_list = get_fqdn_list(data)
-        self.loop.create_task(handle_request(self.loop, data, ClientConnection(self.transport, addr), self.cfg, need_proxy(fqdn_list, self.rules)))
-
-
-class ClientConnection:
-    def __init__(self, transport, addr=None):
-        self.peer, self.addr = transport, addr
-
-    def send_message(self, msg,truncate=-1):
-        if self.addr:
-            if truncate<=0:
-                self.peer.sendto(msg, self.addr)
-            else:
-                truncated=bytearray(msg[:truncate])
-                truncated[2]|=2
-                self.peer.sendto(bytes(truncated),self.addr)
-                print("Truncated",truncated[2])
-            print("UDP response to",self.addr)
-        else:
-            self.peer.write(struct.pack("!H", len(msg)))
-            self.peer.write(msg)
-
-    def close(self):
-        if not self.addr:
-            self.peer.close()
-
-
-async def handle_request(loop: asyncio.AbstractEventLoop, request, peer, config, use_proxy=True):
-    remote = AsyncSocket(loop)
-    parse_dns(request)
+async def handle_tcp_request(config, client, addr):
     try:
-        if use_proxy:
-            await remote.connect(config["proxy_addr"])
-            await remote.sendall(b'\x05\x01\x00')
-            resp = await remote.ensure_recv(2)
-            assert resp == b'\x05\x00'
-            await remote.sendall(b'\x05\x01\x00\x01' + socket.inet_aton(config["remote_addr"][0]) + struct.pack("!H", config["remote_addr"][1]))
-            kind = (await remote.ensure_recv(4))[3]
-            if kind == 1:
-                await remote.ensure_recv(4)
-            elif kind == 3:
-                length = (await remote.ensure_recv(1))[0]
-                await remote.ensure_recv(length)
-            elif kind == 4:
-                await remote.ensure_recv(16)
-            else:
-                print("error", kind)
-            await remote.ensure_recv(2)
-        else:
-            await remote.connect(config["direct_addr"])
-        await remote.sendall(struct.pack("!H", len(request)))
-        await remote.sendall(request)
-        length = struct.unpack("!H", await remote.ensure_recv(2))[0]
-        resp = await remote.ensure_recv(length)
-        parse_dns(resp)
-        peer.send_message(resp)
-        peer.close()
+        client = ExtendedSocket(client)
+        reqlen = await client.recv_uint16be()
+        req = await client.ensure_recv(reqlen)
+        resp = await resolve(config, req, use_proxy=need_proxy(req, config.ruleset))
+        await client.sendall(struct.pack(">H", len(resp)))
+        await client.sendall(resp)
+        await client.close()
     except Exception:
-        with open("exc.txt","a") as f:
-            f.write(datetime.datetime.now().isoformat()+"\n")
-            f.write(traceback.format_exc())
-            f.write("="*30+"\n")
+        log_exception(config)
 
 
-def parse_ip(ip_string):
-    ip, port = ip_string.split(":")
-    port = int(port)
-    return ip, port
+async def handle_udp_request(config, sock, req, addr):
+    try:
+        resp = await resolve(config, req, use_proxy=need_proxy(req, config.ruleset))
+        config.logger.debug(f"UDP LEN {len(resp)}")
+        await sock.sendto(resp, addr)
+    except Exception:
+        log_exception(config)
 
 
-class TCPListenerProtocol(asyncio.Protocol):
-    def __init__(self, config, loop, rules):
-        self.config, self.rules, self.loop = config, rules, loop
+async def udp_listen(config):
+    s = socket.socket(type=socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(config.local_addr)
+    async with s:
+        while True:
+            try:
+                req, addr = await s.recvfrom(10240)
+                await curio.spawn(handle_udp_request, config, s, req, addr, daemon=True)
+            except Exception:
+                if not log_exception(config):
+                    break
 
-    def connection_made(self, transport):
-        client_addr = transport.get_extra_info('peername')
-        print(f'TCP request from {client_addr}')
-        self.transport = transport
-        self.buf = Buffer()
-        self.msg_size = -1
 
-    def data_received(self, data):
-        self.buf.write(data)
-        if self.msg_size == -1 and len(self.buf) >= 2:
-            self.msg_size = self.buf.read_packed(">H")
-        if self.msg_size != -1 and len(self.buf) >= self.msg_size:
-            req = self.buf.read()
-            fqdn_list = get_fqdn_list(req)
-            self.loop.create_task(handle_request(self.loop, req, ClientConnection(self.transport), self.config, need_proxy(fqdn_list, self.rules)))
+async def tcp_listen(config):
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(config.local_addr)
+    s.listen(10)
+    async with s:
+        while True:
+            try:
+                client, addr = await s.accept()
+                await curio.spawn(handle_tcp_request, config, client, addr, daemon=True)
+            except Exception:
+                if not log_exception(config):
+                    break
+
+
+async def serve(config):
+    async with curio.TaskGroup() as tg:
+        await tg.spawn(tcp_listen(config))
+        await tg.spawn(udp_listen(config))
+        await tg.join()
+
+
+def load_ruleset(filename):
+    return [line.strip().rstrip(".") for line in open(filename) if line.strip()]
 
 
 def main():
-    config = json.load(open("config.json"))
+    parser = ArgumentParser()
+    parser.add_argument("--laddr", "-l", help="Listening address", dest="local_addr")
+    parser.add_argument("--raddr", "-r", help="DNS server to query through proxy", dest="remote_addr")
+    parser.add_argument("--paddr", "-p", help="SOCKS proxy to use", dest="proxy_addr")
+    parser.add_argument("--daddr", "-d", help="DNS server to query directly", dest="direct_addr")
+    parser.add_argument("--config", "-c", help="Alternate configuration file to use")
+    parser.add_argument("--rules", "-x", help="List of domains to query directly")
+    parser.add_argument("--log-file", "-o", help="Pipe log to a disk file", default="resolver.log", dest="log_file")
+    args = vars(parser.parse_args())
+    if args["config"]:
+        config = json.load(open(args.get("config")))
+    elif os.path.exists("config.json"):
+        config = json.load(open("config.json"))
+    else:
+        config = {}
     for k in ("local_addr", "proxy_addr", "remote_addr", "direct_addr"):
-        config[k] = parse_ip(config[k])
-    print(config)
-    rules = [line.strip().rstrip(".") for line in open("rules") if line.strip()]
-    print(rules)
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(loop.create_server(lambda: TCPListenerProtocol(config, loop, rules), *config["local_addr"]))
-    loop.run_until_complete(loop.create_datagram_endpoint(lambda: UDPListenerProtocol(config, loop, rules), config["local_addr"]))
-    loop.run_forever()
+        if args[k]:
+            config[k] = args[k]
+        if k in config:
+            config[k] = parse_ip(config[k])
+        else:
+            raise ValueError("Invalid configuration")
+    if args["rules"]:
+        ruleset = load_ruleset(filename=args.get("rules"))
+    elif os.path.exists("rules"):
+        ruleset = load_ruleset(filename="rules")
+    elif "rules" in config:
+        ruleset = config.get("rules")
+    else:
+        ruleset = []
+    config["rules"] = ruleset
+    logger = logging.getLogger("Resolver")
+    logger.setLevel(logging.DEBUG)
+    file_handler = logging.FileHandler(args["log_file"])
+    stderr_handler = logging.StreamHandler(stderr)
+    formatter = logging.Formatter("%(asctime)s:%(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    file_handler.setFormatter(formatter)
+    stderr_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(stderr_handler)
+    logger.info(repr(config))
+    config["logger"] = logger
+    config = Configuration(config, logger, ruleset)
+    try:
+        curio.run(serve, config)
+    except KeyboardInterrupt:
+        return
+    except Exception:
+        log_exception(config)
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
